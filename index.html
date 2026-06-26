@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!--
+  CANARY TRAP PAGE  (docs/canary-trap-page.html)
+  ═══════════════════════════════════════════════
+  Host this on GitHub Pages (or anywhere public).
+  Embed the bait token directly in the source — its presence here IS the canary.
+  Any visitor who loads and submits the page fires the dispatch workflow.
+
+  Replace the three constants below and commit.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Innocuous title — make it blend in -->
+  <title>Webhook Configuration</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 60px auto; color: #333; }
+    button { padding: 10px 24px; background: #2da44e; color: #fff;
+             border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button:disabled { background: #94d3a2; cursor: not-allowed; }
+    #status { margin-top: 16px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h2>Webhook Test</h2>
+  <p>Click the button to send a test ping to the configured endpoint.</p>
+  <button id="btn" onclick="fire()">Send Ping</button>
+  <div id="status"></div>
+
+  <script>
+    // ── CONFIGURE THESE THREE VALUES ────────────────────────────────────────
+    const BAIT_TOKEN = 'github_pat_REPLACE_ME';  // the intentionally exposed PAT
+    const REPO_OWNER = 'your-org';               // GitHub owner / org
+    const REPO_NAME  = 'your-repo';              // repository name
+    // ────────────────────────────────────────────────────────────────────────
+
+    async function fire() {
+      const btn    = document.getElementById('btn');
+      const status = document.getElementById('status');
+
+      btn.disabled  = true;
+      status.textContent = 'Sending…';
+
+      // Collect a handful of browser signals to embed in client_payload.
+      // The workflow will surface these in the filed issue.
+      const clientPayload = {
+        source:     document.referrer   || 'direct',
+        page:       location.href,
+        userAgent:  navigator.userAgent,
+        language:   navigator.language,
+        timestamp:  new Date().toISOString(),
+        screen:     screen.width + 'x' + screen.height,
+        timezone:   Intl.DateTimeFormat().resolvedOptions().timeZone,
+      };
+
+      try {
+        const url = 'https://api.github.com/repos/'
+                  + encodeURIComponent(REPO_OWNER) + '/'
+                  + encodeURIComponent(REPO_NAME)  + '/dispatches';
+
+        const response = await fetch(url, {
+          method:  'POST',
+          headers: {
+            'Authorization':        'Bearer ' + BAIT_TOKEN,
+            'Accept':               'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type':         'application/json',
+          },
+          body: JSON.stringify({
+            event_type:     'canary-trigger',
+            client_payload: clientPayload,
+          }),
+        });
+
+        if (response.status === 204) {
+          status.textContent = '\u2705 Ping sent.';
+        } else {
+          const text = await response.text();
+          status.textContent = '\u26a0\ufe0f Unexpected status ' + response.status + ': ' + text;
+        }
+      } catch (err) {
+        status.textContent = '\u274c Error: ' + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>

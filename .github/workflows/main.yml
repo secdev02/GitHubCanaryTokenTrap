@@ -1,0 +1,175 @@
+# .github/workflows/canary-trap.yml
+#
+# CANARY TOKEN TRAP
+# =================
+# Fires whenever someone POSTs to this repo's dispatch endpoint using
+# the bait token you intentionally expose. On trigger it:
+#   1. Pings your Canarytokens.org URL (or any webhook)
+#   2. Files a GitHub Issue with full request details
+#
+# ── SETUP ───────────────────────────────────────────────────────────────────
+#
+# 1. Create a Fine-Grained PAT (the bait token)
+#    Settings → Developer settings → Fine-grained personal access tokens → New
+#    Scopes needed:  Repository permissions → Contents: Read-only
+#                    Repository permissions → Actions: Read and write  ← lets dispatch fire
+#    Give it a convincingly innocent name ("deploy-webhook-key", "ci-read-token", etc.)
+#    This token is the canary — embed or "accidentally expose" it wherever you want to trap access.
+#
+# 2. Add the real secrets to the repo
+#    Settings → Secrets and variables → Actions → New repository secret
+#      CANARY_TOKEN_URL  — your Canarytokens.org (or similar) callback URL
+#      CANARY_ALERT_TOKEN (optional) — a *different*, privileged PAT used by the
+#                          workflow to create issues; defaults to GITHUB_TOKEN if omitted.
+#
+# 3. Create the labels used below:
+#    gh label create canary   --color "#FF0000" --description "Canary token alert"
+#    gh label create security --color "#FF6600" --description "Security alert"
+#
+# ── TRIGGERING (unauthenticated from caller's perspective) ──────────────────
+#
+# Anyone holding the bait token can POST with no other credentials:
+#
+#   curl -X POST \
+#     -H "Authorization: Bearer <BAIT_TOKEN>" \
+#     -H "Accept: application/vnd.github+json" \
+#     -H "X-GitHub-Api-Version: 2022-11-28" \
+#     https://api.github.com/repos/<OWNER>/<REPO>/dispatches \
+#     -d '{"event_type":"canary-trigger","client_payload":{"source":"readme","note":"test"}}'
+#
+# The caller only needs the single bait token — no repo write access, no
+# other credentials.  That token is the hook.
+#
+# ── OPTIONAL: public HTML trap page ─────────────────────────────────────────
+# Host a page (e.g. GitHub Pages) that fires the dispatch from the browser.
+# See the companion file  docs/canary-trap-page.html  for a ready-to-use example.
+# ────────────────────────────────────────────────────────────────────────────
+
+name: "\U0001FAA4 Canary Token Trap"
+
+on:
+  repository_dispatch:
+    # Only fires on this specific event type — keeps the workflow from
+    # triggering on legitimate dispatch events you may have elsewhere.
+    types: [canary-trigger]
+
+# Minimal permissions: this workflow only needs to open issues.
+permissions:
+  issues: write
+
+jobs:
+  canary-alert:
+    name: Fire Canary & File Issue
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Ping the Canary Token URL ─────────────────────────────────
+      # Sends an HTTP request to your Canarytokens.org webhook so you get an
+      # out-of-band alert (email / Slack / Teams) independent of GitHub.
+      # Failure is non-fatal so the issue is always filed even if the ping fails.
+      - name: Ping Canary Token
+        env:
+          CANARY_URL: ${{ secrets.CANARY_TOKEN_URL }}
+        run: |
+          if [ -z "$CANARY_URL" ]; then
+            echo "::warning::CANARY_TOKEN_URL secret is not set — skipping external ping."
+          else
+            HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 2 \
+              -X POST "$CANARY_URL" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "repo=${{ github.repository }}&run=${{ github.run_id }}&event=dispatch")
+
+            echo "Canary ping HTTP status: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -gt 299 ]; then
+              echo "::warning::Canary token ping returned HTTP $HTTP_STATUS (non-fatal)."
+            fi
+          fi
+
+      # ── Step 2: File a GitHub Issue ───────────────────────────────────────
+      # Builds a rich issue body from all available dispatch context and
+      # creates it in this repository. Uses CANARY_ALERT_TOKEN when set so
+      # the issue-creator identity can differ from the default bot, or falls
+      # back to the automatic GITHUB_TOKEN.
+      - name: File Alert Issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CANARY_ALERT_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            // ── Collect available context ──────────────────────────────────
+            const payload     = context.payload.client_payload ?? {};
+            const payloadJson = JSON.stringify(payload, null, 2);
+            const dispatchType = context.payload.action ?? 'canary-trigger';
+            const now         = new Date();
+            const timestamp   = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+            const runUrl      = context.serverUrl
+                              + '/' + context.repo.owner
+                              + '/' + context.repo.repo
+                              + '/actions/runs/' + context.runId;
+
+            // ── Build metadata table ───────────────────────────────────────
+            const rows = [
+              ['Triggered At',   timestamp],
+              ['Dispatch Type',  '`' + dispatchType + '`'],
+              ['Workflow Run',   '[#' + context.runNumber + '](' + runUrl + ')'],
+              ['Repository',     '`' + context.repo.owner + '/' + context.repo.repo + '`'],
+              ['Workflow',       '`' + context.workflow + '`'],
+            ];
+
+            const tableRows = rows
+              .map(function(row) { return '| **' + row[0] + '** | ' + row[1] + ' |'; })
+              .join('\n');
+
+            // ── Assemble issue body ────────────────────────────────────────
+            const body = [
+              '## \u26a0\ufe0f Canary Token Triggered',
+              '',
+              '_Someone used your bait token to POST to this repository\'s dispatch endpoint._',
+              '',
+              '| Field | Value |',
+              '|-------|-------|',
+              tableRows,
+              '',
+              '### Client Payload',
+              '',
+              '> The `client_payload` object is attacker-controlled — treat all values as untrusted.',
+              '',
+              '```json',
+              payloadJson,
+              '```',
+              '',
+              '---',
+              '',
+              '**Recommended actions**',
+              '',
+              '- [ ] Identify and revoke the bait token that was used.',
+              '- [ ] Check whether the token was used for anything else (GitHub audit log).',
+              '- [ ] Rotate any secrets that may have been accessed.',
+              '- [ ] Review `client_payload` for recon data the caller embedded.',
+              '- [ ] Close this issue once the investigation is complete.',
+            ].join('\n');
+
+            // ── Create the issue ───────────────────────────────────────────
+            const issue = await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  '\uD83D\uDEA8 Canary Triggered \u2014 ' + timestamp,
+              labels: ['canary', 'security'],
+              body:   body,
+            });
+
+            core.notice('Alert issue filed: ' + issue.data.html_url);
+
+            // Also emit a visible annotation in the run summary
+            core.summary
+              .addHeading('\uD83D\uDEA8 Canary Alert Filed')
+              .addTable([
+                [{data: 'Field',         header: true}, {data: 'Value',                header: true}],
+                ['Triggered At',         timestamp],
+                ['Dispatch Type',        dispatchType],
+                ['Issue',                issue.data.html_url],
+              ])
+              .write();
